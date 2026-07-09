@@ -11,7 +11,7 @@
   * { margin:0; padding:0; box-sizing:border-box; }
   body { background:#e5e7eb; font-family:'Helvetica Neue', Helvetica, Arial, sans-serif; min-height:100vh; }
   #app { position:relative; width:100%; max-width:1440px; min-height:900px; margin:0 auto; box-shadow:0 20px 60px rgba(15,23,42,0.25); overflow:hidden; }
-  input, button { font-family:inherit; }
+  input, button, select { font-family:inherit; }
   button { cursor:pointer; border:none; background:none; }
   .block { position:absolute; left:0; width:80px; height:80px; cursor:pointer;
            transition:bottom 0.4s cubic-bezier(0.32,1.4,0.55,1), opacity 0.25s, transform 0.25s; }
@@ -24,39 +24,51 @@
 
 <script>
 /* ============================================================
-   TaskBlocks — vanilla JS + Supabase
-   資料流:v_board_tasks (讀) → tasks.update status='done' (完成,軟刪除)
+   TaskBlocks v2 — vanilla JS + Supabase
+   看板 + 團隊管理(部門/層級/職務)
    ============================================================ */
 
 const SUPABASE_URL = 'https://wmynsxppwnmopifmnrsv.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_S6D7llADQ-s_stOjofNXrg_pttmFXHj';
 const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
 
-/* ---------- 全域狀態(資料驅動渲染) ---------- */
+/* ---------- 全域狀態 ---------- */
 const state = {
   session: null,
-  profile: null,          // 登入者 profile(名字、主題偏好)
-  theme: 'pro',           // 'pro' | 'cute'
-  tasks: [],              // 來自 v_board_tasks
+  profile: null,
+  theme: 'pro',
+  page: 'board',          // 'board' | 'team'
+  tasks: [],
+  people: [],             // 全部成員 profiles
+  departments: [],
+  memberRoles: [],        // member_roles + roles(職務)
   selectedId: null,
-  filterUrgency: 'all',   // 'all' | 'red' | 'yellow' | 'green'
-  filterAssignee: null,   // profile id | null
+  filterUrgency: 'all',
+  filterAssignee: null,
   search: '',
   showAdd: false,
   loading: true,
   authMsg: '',
 };
 
+const LEVELS = { admin:'管理員', manager:'主管', member:'成員' };
 const urgencyMeta = {
-  red:    { color:'#ef4444', bg:'#fef2f2', label:'緊急', cuteBg:'#fca5a5', cuteText:'#7f1d1d' },
-  yellow: { color:'#eab308', bg:'#fefce8', label:'中',   cuteBg:'#fde047', cuteText:'#713f12' },
-  green:  { color:'#22c55e', bg:'#f0fdf4', label:'低',   cuteBg:'#86efac', cuteText:'#14532d' },
+  red:    { color:'#ef4444', bg:'#fef2f2', label:'緊急' },
+  yellow: { color:'#eab308', bg:'#fefce8', label:'中' },
+  green:  { color:'#22c55e', bg:'#f0fdf4', label:'低' },
 };
 
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
-/* ---------- 截止時間格式化:timestamptz → 今天/明天/週X ---------- */
+const isAdmin = () => state.profile?.access_level === 'admin';
+const canAssign = () => ['admin','manager'].includes(state.profile?.access_level);
+const rolesOf = pid => state.memberRoles.filter(m => m.member_id === pid && m.roles)
+  .map(m => ({ id:m.roles.id, name:m.roles.name, primary:m.is_primary }));
+const titleOf = pid => { const r = rolesOf(pid); if (!r.length) return ''; return (r.find(x=>x.primary)||r[0]).name; };
+const deptName = id => (state.departments.find(d => d.id === id) || {}).name || '未分部門';
+
+/* ---------- 截止時間格式化 ---------- */
 function fmtDue(ts) {
   if (!ts) return '未定';
   const d = new Date(ts), now = new Date();
@@ -80,6 +92,17 @@ async function loadTasks() {
   render();
 }
 
+async function loadPeople() {
+  const [p, d, mr] = await Promise.all([
+    db.from('profiles').select('*').order('full_name'),
+    db.from('departments').select('*').order('name'),
+    db.from('member_roles').select('member_id,is_primary,roles(id,name)'),
+  ]);
+  state.people = p.data || [];
+  state.departments = d.data || [];
+  state.memberRoles = mr.data || [];
+}
+
 async function loadProfile() {
   if (!state.session) return;
   const { data } = await db.from('profiles').select('*').eq('id', state.session.user.id).single();
@@ -87,7 +110,6 @@ async function loadProfile() {
 }
 
 async function completeTask(id) {
-  // 先做前端動畫,再寫資料庫(樂觀更新)
   animateRemoval(id);
   state.tasks = state.tasks.filter(t => t.id !== id);
   state.selectedId = null;
@@ -99,9 +121,7 @@ async function completeTask(id) {
 
 async function addTask(payload) {
   const uid = state.session.user.id;
-  const { error } = await db.from('tasks').insert({
-    ...payload, assignee_id: uid, created_by: uid,
-  });
+  const { error } = await db.from('tasks').insert({ assignee_id: uid, ...payload, created_by: uid });
   if (error) { alert('新增失敗:' + error.message); return; }
   state.showAdd = false;
   await loadTasks();
@@ -115,7 +135,48 @@ async function toggleTheme() {
   }
 }
 
-/* ---------- 篩選後的可見任務 ---------- */
+/* ---------- 團隊管理(RLS 只放行 admin,UI 同步防呆) ---------- */
+async function setLevel(pid, lvl) {
+  const { error } = await db.from('profiles').update({ access_level: lvl }).eq('id', pid);
+  if (error) alert('調整層級失敗:' + error.message);
+  await loadPeople(); if (pid === state.session.user.id) await loadProfile();
+  render();
+}
+async function setDept(pid, did) {
+  const { error } = await db.from('profiles').update({ department_id: did || null }).eq('id', pid);
+  if (error) alert('調整部門失敗:' + error.message);
+  await loadPeople(); if (pid === state.session.user.id) await loadProfile();
+  render();
+}
+async function addDepartment() {
+  const name = prompt('部門名稱:');
+  if (!name || !name.trim()) return;
+  const { error } = await db.from('departments').insert({ name: name.trim() });
+  if (error) alert('新增部門失敗:' + error.message);
+  await loadPeople(); render();
+}
+async function addRoleTo(pid) {
+  const name = prompt('職務名稱(例:前端工程師):');
+  if (!name || !name.trim()) return;
+  let rid;
+  const { data: r } = await db.from('roles').select('id').eq('name', name.trim()).maybeSingle();
+  if (r) rid = r.id;
+  else {
+    const { data: nr, error } = await db.from('roles').insert({ name: name.trim() }).select('id').single();
+    if (error) { alert('建立職務失敗:' + error.message); return; }
+    rid = nr.id;
+  }
+  const { error: e2 } = await db.from('member_roles').insert({ member_id: pid, role_id: rid });
+  if (e2) alert('指派職務失敗:' + e2.message);
+  await loadPeople(); await loadTasks(); render();
+}
+async function removeRoleFrom(pid, rid) {
+  const { error } = await db.from('member_roles').delete().eq('member_id', pid).eq('role_id', rid);
+  if (error) alert('移除職務失敗:' + error.message);
+  await loadPeople(); await loadTasks(); render();
+}
+
+/* ---------- 篩選 ---------- */
 function visibleTasks() {
   return state.tasks.filter(t =>
     (state.filterUrgency === 'all' || t.urgency === state.filterUrgency) &&
@@ -145,11 +206,10 @@ function assigneeList() {
   return [...seen.values()];
 }
 
-/* ---------- 完成動畫:方塊消除 + 上方方塊重力下落 ---------- */
+/* ---------- 完成動畫 ---------- */
 function animateRemoval(id) {
   const el = document.querySelector(`.block[data-id="${id}"]`);
   if (el) el.classList.add('removing');
-  // 重算剩餘方塊位置,transition 會自動播放下落動畫
   const remain = visibleTasks().filter(t => t.id !== id);
   [0,1,2].forEach(c => {
     remain.filter((_, i) => i % 3 === c).forEach((t, i) => {
@@ -186,7 +246,7 @@ function viewLoading() {
   return `<div style="min-height:900px;display:flex;align-items:center;justify-content:center;background:#f8fafc;color:#64748b;font-size:14px;">載入中…</div>`;
 }
 
-/* ---------- 登入畫面(Magic Link) ---------- */
+/* ---------- 登入(Magic Link) ---------- */
 function viewLogin() {
   return `
   <div style="min-height:900px;display:flex;align-items:center;justify-content:center;background:#0f172a;">
@@ -220,7 +280,7 @@ function bindLogin() {
   };
 }
 
-/* ---------- 方塊(專業) ---------- */
+/* ---------- 方塊 ---------- */
 function proBlock(t, i) {
   const m = urgencyMeta[t.urgency] || urgencyMeta.green;
   return `
@@ -229,7 +289,6 @@ function proBlock(t, i) {
     <div style="font-size:11px;font-weight:700;color:#e2e8f0;text-align:center;padding:0 4px;line-height:1.2;">${esc(t.code)}</div>
   </div>`;
 }
-/* ---------- 方塊(可愛小怪物) ---------- */
 function cuteBlock(t, i) {
   const m = urgencyMeta[t.urgency] || urgencyMeta.green;
   const c = m.color;
@@ -246,25 +305,103 @@ function cuteBlock(t, i) {
     <div style="font-size:9px;font-weight:700;color:#1f2937;text-align:center;margin-top:5px;">${esc(t.code)}</div>
   </div>`;
 }
-
 function colHeight() {
   const maxLen = Math.max(3, ...columns().map(c => c.length));
   return maxLen * 82 + 2;
 }
 
+/* ---------- 團隊管理頁(嵌入兩種主題的內容區) ---------- */
+function viewTeamContent() {
+  const cute = state.theme === 'cute';
+  const card = cute ? 'background:#fff;border:4px dashed #1f2937;border-radius:32px;' : 'background:#fff;border:1px solid #e2e8f0;';
+  const chip = cute ? 'border:2px solid #1f2937;border-radius:999px;background:#fde68a;color:#78350f;' : 'border:1px solid #cbd5e1;background:#f1f5f9;color:#334155;';
+  const sel = cute ? 'padding:6px 10px;border:2px solid #1f2937;border-radius:10px;font-size:12px;background:#fff;color:#1f2937;' : 'padding:6px 10px;border:1px solid #cbd5e1;font-size:12px;background:#f8fafc;color:#0f172a;';
+  const tx = cute ? '#1f2937' : '#0f172a';
+  const admin = isAdmin();
+  const rows = state.people.map(p => {
+    const roles = rolesOf(p.id);
+    const chips = (roles.map(r => `
+      <span style="display:inline-flex;align-items:center;gap:6px;padding:3px 10px;font-size:11px;font-weight:700;${chip}">
+        ${esc(r.name)}${r.primary ? ' ★' : ''}
+        ${admin ? `<button data-rmrole="${p.id}|${r.id}" title="移除職務" style="font-size:11px;color:inherit;line-height:1;">✕</button>` : ''}
+      </span>`).join('')
+      || `<span style="font-size:11px;color:#94a3b8;">尚無職務</span>`);
+    return `
+    <div style="display:flex;align-items:center;gap:16px;padding:14px 0;border-bottom:1px ${cute?'dashed':'solid'} ${cute?'#1f2937':'#e2e8f0'};flex-wrap:wrap;">
+      <div style="display:flex;align-items:center;gap:10px;width:210px;flex-shrink:0;">
+        <div style="width:32px;height:32px;${cute?'border-radius:50%;border:2px solid #1f2937;':''}background:${esc(p.avatar_color||'#94a3b8')};color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${esc(p.initials||'?')}</div>
+        <div style="min-width:0;">
+          <div style="font-size:14px;font-weight:700;color:${tx};">${esc(p.full_name)}${p.id===state.session.user.id?'(你)':''}</div>
+          <div style="font-size:11px;color:#94a3b8;overflow:hidden;text-overflow:ellipsis;">${esc(p.email||'')}</div>
+        </div>
+      </div>
+      <div style="flex:1;min-width:220px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+        ${chips}
+        ${admin ? `<button data-addrole="${p.id}" style="font-size:11px;font-weight:700;padding:3px 10px;${chip}">＋職務</button>` : ''}
+      </div>
+      <select data-dept="${p.id}" ${admin ? '' : 'disabled'} style="${sel}">
+        <option value="">未分部門</option>
+        ${state.departments.map(d => `<option value="${d.id}" ${p.department_id===d.id?'selected':''}>${esc(d.name)}</option>`).join('')}
+      </select>
+      <select data-lvl="${p.id}" ${admin ? '' : 'disabled'} style="${sel}">
+        ${['admin','manager','member'].map(l => `<option value="${l}" ${p.access_level===l?'selected':''}>${LEVELS[l]}</option>`).join('')}
+      </select>
+    </div>`;
+  }).join('');
+  return `
+  <div style="${card}padding:28px;flex:1;min-width:680px;align-self:flex-start;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;">
+      <div style="font-size:16px;font-weight:700;color:${tx};">團隊成員(${state.people.length})</div>
+      ${admin ? `<button id="add-dept" style="padding:8px 14px;font-size:12px;font-weight:700;${cute?'background:#86efac;color:#14532d;border-radius:999px;border:2px solid #1f2937;':'background:#0f172a;color:#fff;'}">＋ 新增部門</button>` : ''}
+    </div>
+    <div style="font-size:12px;color:#94a3b8;margin-bottom:12px;">
+      ${admin ? '你是管理員,可調整每位成員的職務(★ 為主要職務)、部門與層級。' : '僅管理員可調整成員設定,你目前為「' + (LEVELS[state.profile?.access_level]||'成員') + '」。'}
+    </div>
+    ${rows || '<div style="color:#94a3b8;font-size:13px;padding:20px 0;">尚無成員</div>'}
+  </div>`;
+}
+
 /* ---------- 專業模式 ---------- */
 function viewPro() {
   const c = counts(), cols = columns(), h = colHeight();
+  const navItem = (key, label, icon) => {
+    const active = state.page === key;
+    const clickable = key === 'board' || key === 'team';
+    return `<div ${clickable?`data-nav="${key}"`:''} style="display:flex;align-items:center;gap:12px;padding:10px 12px;font-size:14px;${active?'background:#1e293b;color:#fff;font-weight:600;':'color:#94a3b8;'}${clickable?'cursor:pointer;':''}"><div style="width:16px;height:16px;${icon}background:${active?'#fff':'#64748b'};"></div>${label}</div>`;
+  };
   const uBtn = (key, label, color) => {
     const on = state.filterUrgency === key;
     return key === 'all'
       ? `<button data-uf="all" style="padding:6px 12px;background:${on?'#1e293b':'transparent'};border:1px solid ${on?'#1e293b':'#334155'};color:#fff;font-size:12px;font-weight:600;">全部</button>`
       : `<button data-uf="${key}" style="padding:6px 12px;border:1px solid #334155;background:${on?'#1e293b':'transparent'};color:${color};font-size:12px;display:flex;align-items:center;gap:6px;"><span style="width:6px;height:6px;background:${color};"></span>${label}</button>`;
   };
-  const people = assigneeList().map(p => `
+  const people = assigneeList().map(p => {
+    const title = titleOf(p.id);
+    return `
     <button data-af="${p.id}" style="display:flex;align-items:center;gap:10px;color:${state.filterAssignee===p.id?'#fff':'#cbd5e1'};font-size:13px;text-align:left;">
-      <div style="width:20px;height:20px;background:${esc(p.color)};color:#fff;font-size:10px;display:flex;align-items:center;justify-content:center;font-weight:700;">${esc(p.initials)}</div>${esc(p.name)}
-    </button>`).join('');
+      <div style="width:20px;height:20px;background:${esc(p.color)};color:#fff;font-size:10px;display:flex;align-items:center;justify-content:center;font-weight:700;flex-shrink:0;">${esc(p.initials)}</div>
+      <span>${esc(p.name)}${title?`<span style="display:block;font-size:10px;color:#64748b;">${esc(title)}</span>`:''}</span>
+    </button>`;
+  }).join('');
+  const boardContent = `
+    <div style="background:#fff;border:1px solid #e2e8f0;padding:24px;flex-shrink:0;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;gap:24px;">
+        <div style="font-size:16px;font-weight:700;color:#0f172a;">今日任務容器</div>
+        <div style="display:flex;gap:14px;font-size:12px;color:#64748b;">
+          <span><span style="color:#ef4444;font-weight:700;">●</span> 緊急 <span data-count="red">${c.red}</span></span>
+          <span><span style="color:#eab308;font-weight:700;">●</span> 中 <span data-count="yellow">${c.yellow}</span></span>
+          <span><span style="color:#22c55e;font-weight:700;">●</span> 低 <span data-count="green">${c.green}</span></span>
+        </div>
+      </div>
+      <div style="border-left:6px solid #0f172a;border-right:6px solid #0f172a;border-bottom:6px solid #0f172a;background:#e2e8f0;box-shadow:inset 0 -14px 24px rgba(15,23,42,0.08);padding:20px;display:flex;gap:16px;">
+        ${cols.map(col=>`<div style="position:relative;width:80px;height:${h}px;">${col.map((t,i)=>proBlock(t,i)).join('')}</div>`).join('')}
+      </div>
+      ${c.total===0?'<div style="text-align:center;color:#94a3b8;font-size:13px;margin-top:16px;">容器空空的 — 按「＋ 新增任務」放入第一個方塊。</div>':''}
+    </div>
+    <div style="background:#fff;border:1px solid #e2e8f0;padding:24px;width:280px;flex-shrink:0;align-self:flex-start;">
+      <div style="font-size:14px;font-weight:700;color:#0f172a;margin-bottom:12px;">操作說明</div>
+      <div style="font-size:12px;color:#64748b;line-height:1.8;">點擊任一方塊查看任務詳情。<br>按下「完成」後,該方塊會消除,上層方塊將依重力往下掉落,補上空位。</div>
+    </div>`;
   return `
   <div style="display:flex;width:100%;min-height:900px;background:#f8fafc;">
     <div style="width:240px;flex-shrink:0;background:#0f172a;display:flex;flex-direction:column;padding:28px 20px;">
@@ -274,8 +411,11 @@ function viewPro() {
       </div>
       <div style="color:#64748b;font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:12px;">導覽</div>
       <div style="display:flex;flex-direction:column;gap:4px;margin-bottom:32px;">
-        <div style="display:flex;align-items:center;gap:12px;padding:10px 12px;background:#1e293b;color:#fff;font-size:14px;font-weight:600;"><div style="width:16px;height:16px;background:#fff;"></div>看板</div>
-        ${['日曆','團隊','報表','設定'].map((n,i)=>`<div style="display:flex;align-items:center;gap:12px;padding:10px 12px;color:#94a3b8;font-size:14px;"><div style="width:16px;height:16px;${i===1?'border-radius:50%;':''}background:#64748b;"></div>${n}</div>`).join('')}
+        ${navItem('board','看板','')}
+        ${navItem('calendar','日曆','')}
+        ${navItem('team','團隊','border-radius:50%;')}
+        ${navItem('report','報表','')}
+        ${navItem('settings','設定','')}
       </div>
       <div style="color:#64748b;font-size:11px;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:12px;">依緊急程度</div>
       <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:28px;">
@@ -291,11 +431,11 @@ function viewPro() {
     <div style="flex:1;display:flex;flex-direction:column;">
       <div style="height:84px;flex-shrink:0;background:#fff;border-bottom:1px solid #e2e8f0;display:flex;align-items:center;justify-content:space-between;padding:0 32px;">
         <div>
-          <div style="font-size:22px;font-weight:700;color:#0f172a;">我的工作方塊</div>
-          <div style="font-size:13px;color:#64748b;margin-top:2px;">承辦人:${esc(state.profile?.full_name||'')}　·　共 <span data-count="total">${c.total}</span> 個進行中任務</div>
+          <div style="font-size:22px;font-weight:700;color:#0f172a;">${state.page==='team'?'團隊管理':'我的工作方塊'}</div>
+          <div style="font-size:13px;color:#64748b;margin-top:2px;">承辦人:${esc(state.profile?.full_name||'')}(${LEVELS[state.profile?.access_level]||'成員'})　·　${deptName(state.profile?.department_id)}　·　共 <span data-count="total">${c.total}</span> 個進行中任務</div>
         </div>
         <div style="display:flex;align-items:center;gap:20px;">
-          <input id="search" value="${esc(state.search)}" placeholder="搜尋任務..." style="width:220px;padding:9px 12px;border:1px solid #cbd5e1;font-size:13px;color:#0f172a;background:#f8fafc;">
+          <input id="search" value="${esc(state.search)}" placeholder="搜尋任務..." style="width:200px;padding:9px 12px;border:1px solid #cbd5e1;font-size:13px;color:#0f172a;background:#f8fafc;">
           <button id="add-btn" style="padding:9px 16px;background:#0f172a;color:#fff;font-size:13px;font-weight:700;">＋ 新增任務</button>
           <div id="theme-toggle" style="display:flex;align-items:center;gap:10px;cursor:pointer;">
             <span style="font-size:12px;color:#64748b;font-weight:600;">專業模式</span>
@@ -306,24 +446,7 @@ function viewPro() {
         </div>
       </div>
       <div style="flex:1;padding:32px;display:flex;gap:24px;flex-wrap:wrap;">
-        <div style="background:#fff;border:1px solid #e2e8f0;padding:24px;flex-shrink:0;">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;gap:24px;">
-            <div style="font-size:16px;font-weight:700;color:#0f172a;">今日任務容器</div>
-            <div style="display:flex;gap:14px;font-size:12px;color:#64748b;">
-              <span><span style="color:#ef4444;font-weight:700;">●</span> 緊急 <span data-count="red">${c.red}</span></span>
-              <span><span style="color:#eab308;font-weight:700;">●</span> 中 <span data-count="yellow">${c.yellow}</span></span>
-              <span><span style="color:#22c55e;font-weight:700;">●</span> 低 <span data-count="green">${c.green}</span></span>
-            </div>
-          </div>
-          <div style="border-left:6px solid #0f172a;border-right:6px solid #0f172a;border-bottom:6px solid #0f172a;background:#e2e8f0;box-shadow:inset 0 -14px 24px rgba(15,23,42,0.08);padding:20px;display:flex;gap:16px;">
-            ${cols.map(col=>`<div style="position:relative;width:80px;height:${h}px;">${col.map((t,i)=>proBlock(t,i)).join('')}</div>`).join('')}
-          </div>
-          ${c.total===0?'<div style="text-align:center;color:#94a3b8;font-size:13px;margin-top:16px;">容器空空的 — 按「＋ 新增任務」放入第一個方塊。</div>':''}
-        </div>
-        <div style="background:#fff;border:1px solid #e2e8f0;padding:24px;width:280px;flex-shrink:0;align-self:flex-start;">
-          <div style="font-size:14px;font-weight:700;color:#0f172a;margin-bottom:12px;">操作說明</div>
-          <div style="font-size:12px;color:#64748b;line-height:1.8;">點擊任一方塊查看任務詳情。<br>按下「完成」後,該方塊會消除,上層方塊將依重力往下掉落,補上空位。</div>
-        </div>
+        ${state.page==='team' ? viewTeamContent() : boardContent}
       </div>
     </div>
   </div>`;
@@ -332,16 +455,47 @@ function viewPro() {
 /* ---------- 可愛模式 ---------- */
 function viewCute() {
   const c = counts(), cols = columns(), h = colHeight();
+  const navColors = { board:'#fca5a5', calendar:'#a7f3d0', team:'#93c5fd', report:'#fca5a5', settings:'#a7f3d0' };
+  const navItem = (key, label) => {
+    const active = state.page === key;
+    const clickable = key === 'board' || key === 'team';
+    return active
+      ? `<div ${clickable?`data-nav="${key}"`:''} style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:#fff;border:3px solid #1f2937;border-radius:16px;color:#1f2937;font-size:14px;font-weight:600;${clickable?'cursor:pointer;':''}"><div style="width:16px;height:16px;border-radius:50%;background:${navColors[key]};"></div>${label}</div>`
+      : `<div ${clickable?`data-nav="${key}"`:''} style="display:flex;align-items:center;gap:12px;padding:10px 14px;color:#78350f;font-size:14px;font-weight:600;${clickable?'cursor:pointer;':''}"><div style="width:16px;height:16px;border-radius:50%;background:${navColors[key]};"></div>${label}</div>`;
+  };
   const pill = (key, label, bg, tx) => {
     const on = state.filterUrgency === key;
     return key === 'all'
       ? `<button data-uf="all" style="padding:6px 14px;background:${on?'#1f2937':'#fef9c3'};color:${on?'#fef08a':'#78350f'};font-size:12px;font-weight:700;border-radius:999px;border:2px solid #1f2937;">全部</button>`
       : `<button data-uf="${key}" style="padding:6px 14px;background:${bg};color:${tx};font-size:12px;font-weight:700;border-radius:999px;border:2px solid #1f2937;${on?'box-shadow:0 0 0 3px #1f2937;':''}">${label}</button>`;
   };
-  const people = assigneeList().map(p => `
+  const people = assigneeList().map(p => {
+    const title = titleOf(p.id);
+    return `
     <button data-af="${p.id}" style="display:flex;align-items:center;gap:10px;color:#1f2937;font-size:13px;font-weight:${state.filterAssignee===p.id?'800':'600'};text-align:left;">
-      <div style="width:22px;height:22px;border-radius:50%;background:${esc(p.color)};color:#fff;font-size:10px;display:flex;align-items:center;justify-content:center;font-weight:700;border:2px solid #1f2937;">${esc(p.initials)}</div>${esc(p.name)}
-    </button>`).join('');
+      <div style="width:22px;height:22px;border-radius:50%;background:${esc(p.color)};color:#fff;font-size:10px;display:flex;align-items:center;justify-content:center;font-weight:700;border:2px solid #1f2937;flex-shrink:0;">${esc(p.initials)}</div>
+      <span>${esc(p.name)}${title?`<span style="display:block;font-size:10px;color:#a16207;">${esc(title)}</span>`:''}</span>
+    </button>`;
+  }).join('');
+  const boardContent = `
+    <div style="background:#fff;border:4px dashed #1f2937;border-radius:32px;padding:24px;flex-shrink:0;">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;gap:24px;">
+        <div style="font-size:16px;font-weight:700;color:#1f2937;">小怪物工作罐</div>
+        <div style="display:flex;gap:10px;font-size:12px;color:#78350f;font-weight:700;">
+          <span style="background:#fca5a5;padding:4px 10px;border-radius:999px;border:2px solid #1f2937;">緊急 <span data-count="red">${c.red}</span></span>
+          <span style="background:#fde047;padding:4px 10px;border-radius:999px;border:2px solid #1f2937;">中 <span data-count="yellow">${c.yellow}</span></span>
+          <span style="background:#86efac;padding:4px 10px;border-radius:999px;border:2px solid #1f2937;">低 <span data-count="green">${c.green}</span></span>
+        </div>
+      </div>
+      <div style="border-left:8px solid #1f2937;border-right:8px solid #1f2937;border-bottom:8px solid #1f2937;border-radius:0 0 26px 26px;background:#fef3c7;padding:20px;display:flex;gap:10px;">
+        ${cols.map(col=>`<div style="position:relative;width:80px;height:${h}px;">${col.map((t,i)=>cuteBlock(t,i)).join('')}</div>`).join('')}
+      </div>
+      ${c.total===0?'<div style="text-align:center;color:#a16207;font-size:13px;font-weight:600;margin-top:16px;">罐子裡沒有小怪物 — 按「＋ 放一隻進去」吧!</div>':''}
+    </div>
+    <div style="background:#fff;border:4px dashed #1f2937;border-radius:24px;padding:24px;width:280px;flex-shrink:0;align-self:flex-start;">
+      <div style="font-size:15px;font-weight:700;color:#1f2937;margin-bottom:12px;">怎麼玩?</div>
+      <div style="font-size:12px;color:#78350f;font-weight:600;line-height:1.8;">點一下小怪物看看它在忙什麼!<br>按「完成」它就會開心地消失,上面的怪物會咚咚咚掉下來喔!</div>
+    </div>`;
   return `
   <div style="display:flex;width:100%;min-height:900px;background:#fffbeb;font-family:'Fredoka',Helvetica,Arial,sans-serif;">
     <div style="width:240px;flex-shrink:0;background:#fef08a;display:flex;flex-direction:column;padding:28px 20px;border-right:4px solid #1f2937;">
@@ -351,8 +505,11 @@ function viewCute() {
       </div>
       <div style="color:#78350f;font-size:11px;font-weight:700;letter-spacing:0.06em;margin-bottom:12px;">導覽</div>
       <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:28px;">
-        <div style="display:flex;align-items:center;gap:12px;padding:10px 14px;background:#fff;border:3px solid #1f2937;border-radius:16px;color:#1f2937;font-size:14px;font-weight:600;"><div style="width:16px;height:16px;border-radius:50%;background:#fca5a5;"></div>看板</div>
-        ${[['日曆','#a7f3d0'],['團隊','#93c5fd'],['報表','#fca5a5'],['設定','#a7f3d0']].map(([n,cl])=>`<div style="display:flex;align-items:center;gap:12px;padding:10px 14px;color:#78350f;font-size:14px;font-weight:600;"><div style="width:16px;height:16px;border-radius:50%;background:${cl};"></div>${n}</div>`).join('')}
+        ${navItem('board','看板')}
+        ${navItem('calendar','日曆')}
+        ${navItem('team','團隊')}
+        ${navItem('report','報表')}
+        ${navItem('settings','設定')}
       </div>
       <div style="color:#78350f;font-size:11px;font-weight:700;letter-spacing:0.06em;margin-bottom:12px;">依緊急程度</div>
       <div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:26px;">
@@ -368,11 +525,11 @@ function viewCute() {
     <div style="flex:1;display:flex;flex-direction:column;">
       <div style="height:88px;flex-shrink:0;background:#fffbeb;border-bottom:4px solid #1f2937;display:flex;align-items:center;justify-content:space-between;padding:0 32px;">
         <div>
-          <div style="font-size:24px;font-weight:700;color:#1f2937;">我的工作方塊</div>
-          <div style="font-size:13px;color:#78350f;font-weight:600;margin-top:2px;">承辦人:${esc(state.profile?.full_name||'')}　·　共 <span data-count="total">${c.total}</span> 隻小怪物在等你</div>
+          <div style="font-size:24px;font-weight:700;color:#1f2937;">${state.page==='team'?'團隊管理':'我的工作方塊'}</div>
+          <div style="font-size:13px;color:#78350f;font-weight:600;margin-top:2px;">承辦人:${esc(state.profile?.full_name||'')}(${LEVELS[state.profile?.access_level]||'成員'})　·　${deptName(state.profile?.department_id)}　·　共 <span data-count="total">${c.total}</span> 隻小怪物在等你</div>
         </div>
         <div style="display:flex;align-items:center;gap:20px;">
-          <input id="search" value="${esc(state.search)}" placeholder="搜尋任務..." style="width:220px;padding:9px 14px;border:3px solid #1f2937;border-radius:999px;font-size:13px;color:#1f2937;background:#fff;">
+          <input id="search" value="${esc(state.search)}" placeholder="搜尋任務..." style="width:200px;padding:9px 14px;border:3px solid #1f2937;border-radius:999px;font-size:13px;color:#1f2937;background:#fff;">
           <button id="add-btn" style="padding:9px 18px;background:#86efac;color:#14532d;font-size:13px;font-weight:700;border-radius:999px;border:3px solid #1f2937;">＋ 放一隻進去</button>
           <div id="theme-toggle" style="display:flex;align-items:center;gap:10px;cursor:pointer;">
             <span style="font-size:12px;color:#78350f;font-weight:700;">可愛模式</span>
@@ -383,24 +540,7 @@ function viewCute() {
         </div>
       </div>
       <div style="flex:1;padding:32px;display:flex;gap:24px;flex-wrap:wrap;">
-        <div style="background:#fff;border:4px dashed #1f2937;border-radius:32px;padding:24px;flex-shrink:0;">
-          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;gap:24px;">
-            <div style="font-size:16px;font-weight:700;color:#1f2937;">小怪物工作罐</div>
-            <div style="display:flex;gap:10px;font-size:12px;color:#78350f;font-weight:700;">
-              <span style="background:#fca5a5;padding:4px 10px;border-radius:999px;border:2px solid #1f2937;">緊急 <span data-count="red">${c.red}</span></span>
-              <span style="background:#fde047;padding:4px 10px;border-radius:999px;border:2px solid #1f2937;">中 <span data-count="yellow">${c.yellow}</span></span>
-              <span style="background:#86efac;padding:4px 10px;border-radius:999px;border:2px solid #1f2937;">低 <span data-count="green">${c.green}</span></span>
-            </div>
-          </div>
-          <div style="border-left:8px solid #1f2937;border-right:8px solid #1f2937;border-bottom:8px solid #1f2937;border-radius:0 0 26px 26px;background:#fef3c7;padding:20px;display:flex;gap:10px;">
-            ${cols.map(col=>`<div style="position:relative;width:80px;height:${h}px;">${col.map((t,i)=>cuteBlock(t,i)).join('')}</div>`).join('')}
-          </div>
-          ${c.total===0?'<div style="text-align:center;color:#a16207;font-size:13px;font-weight:600;margin-top:16px;">罐子裡沒有小怪物 — 按「＋ 放一隻進去」吧!</div>':''}
-        </div>
-        <div style="background:#fff;border:4px dashed #1f2937;border-radius:24px;padding:24px;width:280px;flex-shrink:0;align-self:flex-start;">
-          <div style="font-size:15px;font-weight:700;color:#1f2937;margin-bottom:12px;">怎麼玩?</div>
-          <div style="font-size:12px;color:#78350f;font-weight:600;line-height:1.8;">點一下小怪物看看它在忙什麼!<br>按「完成」它就會開心地消失,上面的怪物會咚咚咚掉下來喔!</div>
-        </div>
+        ${state.page==='team' ? viewTeamContent() : boardContent}
       </div>
     </div>
   </div>`;
@@ -414,6 +554,8 @@ function viewModal() {
   const cute = state.theme === 'cute';
   const delegated = t.is_delegated
     ? `<div style="font-size:12px;color:${cute?'#7f1d1d':'#b45309'};font-weight:700;margin-bottom:14px;">🔁 代理中:${esc(t.effective_name||'')}</div>` : '';
+  const roleLine = t.role_name
+    ? `<span style="display:block;font-size:11px;color:${cute?'#a16207':'#94a3b8'};">${esc(t.role_name)}</span>` : '';
   const inner = cute ? `
     <div class="tb-card" style="width:380px;background:#fffbeb;border:4px solid #1f2937;border-radius:28px;padding:32px;font-family:'Fredoka',Helvetica,Arial,sans-serif;">
       <div style="display:inline-block;padding:4px 12px;background:${m.color};color:#1f2937;font-size:11px;font-weight:700;border-radius:999px;border:2px solid #1f2937;margin-bottom:14px;">${m.label}</div>
@@ -421,8 +563,8 @@ function viewModal() {
       <div style="font-size:13px;color:#78350f;font-weight:600;margin-bottom:18px;">截止:${fmtDue(t.due_at)}</div>
       ${delegated}
       <div style="display:flex;align-items:center;gap:10px;padding-bottom:20px;margin-bottom:20px;border-bottom:3px dashed #1f2937;">
-        <div style="width:30px;height:30px;border-radius:50%;background:${esc(t.avatarColor||'#94a3b8')};color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;border:2px solid #1f2937;">${esc(t.initials||'?')}</div>
-        <span style="font-size:13px;color:#1f2937;font-weight:700;">${esc(t.name||'未指派')}</span>
+        <div style="width:30px;height:30px;border-radius:50%;background:${esc(t.avatarColor||'#94a3b8')};color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;border:2px solid #1f2937;flex-shrink:0;">${esc(t.initials||'?')}</div>
+        <span style="font-size:13px;color:#1f2937;font-weight:700;">${esc(t.name||'未指派')}${roleLine}</span>
       </div>
       <div style="display:flex;gap:10px;">
         <button id="complete-btn" style="flex:1;padding:12px;background:#86efac;color:#14532d;font-size:13px;font-weight:700;border-radius:999px;border:2px solid #1f2937;">完成 🎉</button>
@@ -435,8 +577,8 @@ function viewModal() {
       <div style="font-size:13px;color:#64748b;margin-bottom:18px;">截止:${fmtDue(t.due_at)}</div>
       ${delegated}
       <div style="display:flex;align-items:center;gap:10px;padding-bottom:20px;margin-bottom:20px;border-bottom:1px solid #e2e8f0;">
-        <div style="width:28px;height:28px;background:${esc(t.avatarColor||'#94a3b8')};color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;">${esc(t.initials||'?')}</div>
-        <span style="font-size:13px;color:#334155;font-weight:600;">${esc(t.name||'未指派')}</span>
+        <div style="width:28px;height:28px;background:${esc(t.avatarColor||'#94a3b8')};color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center;flex-shrink:0;">${esc(t.initials||'?')}</div>
+        <span style="font-size:13px;color:#334155;font-weight:600;">${esc(t.name||'未指派')}${roleLine}</span>
       </div>
       <div style="display:flex;gap:10px;">
         <button id="complete-btn" style="flex:1;padding:11px;background:#0f172a;color:#fff;font-size:13px;font-weight:700;">完成</button>
@@ -454,8 +596,13 @@ function viewAddModal() {
     ? 'background:#fffbeb;border:4px solid #1f2937;border-radius:28px;font-family:\'Fredoka\',Helvetica,Arial,sans-serif;'
     : 'background:#fff;border:1px solid #e2e8f0;';
   const inp = cute
-    ? 'width:100%;padding:10px 14px;border:3px solid #1f2937;border-radius:14px;font-size:13px;margin-bottom:12px;background:#fff;'
-    : 'width:100%;padding:10px 12px;border:1px solid #cbd5e1;font-size:13px;margin-bottom:12px;background:#f8fafc;';
+    ? 'width:100%;padding:10px 14px;border:3px solid #1f2937;border-radius:14px;font-size:13px;margin-bottom:12px;background:#fff;color:#1f2937;'
+    : 'width:100%;padding:10px 12px;border:1px solid #cbd5e1;font-size:13px;margin-bottom:12px;background:#f8fafc;color:#0f172a;';
+  const assigneeSel = canAssign() ? `
+      <div style="font-size:11px;font-weight:700;color:#94a3b8;margin-bottom:6px;">指派給(${LEVELS[state.profile?.access_level]}權限)</div>
+      <select id="f-assignee" style="${inp}">
+        ${state.people.map(p => `<option value="${p.id}" ${p.id===state.session.user.id?'selected':''}>${esc(p.full_name)} · ${esc(deptName(p.department_id))}</option>`).join('')}
+      </select>` : '';
   return `
   <div class="tb-modal" id="add-modal" style="position:absolute;inset:0;background:rgba(15,23,42,0.55);display:flex;align-items:center;justify-content:center;z-index:60;">
     <div class="tb-card" style="width:380px;padding:32px;${box}">
@@ -468,6 +615,7 @@ function viewAddModal() {
         <option value="yellow" selected>中(黃)</option>
         <option value="green">低(綠)</option>
       </select>
+      ${assigneeSel}
       <div style="display:flex;gap:10px;margin-top:6px;">
         <button id="save-task" style="flex:1;padding:11px;font-size:13px;font-weight:700;${cute?'background:#86efac;color:#14532d;border-radius:999px;border:2px solid #1f2937;':'background:#0f172a;color:#fff;'}">建立</button>
         <button id="cancel-task" style="flex:1;padding:11px;font-size:13px;font-weight:700;${cute?'background:#fff;color:#1f2937;border-radius:999px;border:2px solid #1f2937;':'border:1px solid #cbd5e1;background:#fff;color:#334155;'}">取消</button>
@@ -478,6 +626,8 @@ function viewAddModal() {
 
 /* ---------- 事件綁定 ---------- */
 function bindBoard() {
+  document.querySelectorAll('[data-nav]').forEach(el =>
+    el.onclick = () => { state.page = el.dataset.nav; render(); });
   document.querySelectorAll('.block').forEach(el =>
     el.onclick = () => { state.selectedId = Number(el.dataset.id); renderModal(); });
   document.querySelectorAll('[data-uf]').forEach(el =>
@@ -497,6 +647,17 @@ function bindBoard() {
   if (add) add.onclick = () => { state.showAdd = true; renderModal(); };
   const out = document.getElementById('signout');
   if (out) out.onclick = async () => { await db.auth.signOut(); };
+  /* 團隊頁控制項 */
+  document.querySelectorAll('[data-lvl]').forEach(el =>
+    el.onchange = () => setLevel(el.dataset.lvl, el.value));
+  document.querySelectorAll('[data-dept]').forEach(el =>
+    el.onchange = () => setDept(el.dataset.dept, el.value));
+  document.querySelectorAll('[data-addrole]').forEach(el =>
+    el.onclick = () => addRoleTo(el.dataset.addrole));
+  document.querySelectorAll('[data-rmrole]').forEach(el =>
+    el.onclick = () => { const [p, r] = el.dataset.rmrole.split('|'); removeRoleFrom(p, r); });
+  const ad = document.getElementById('add-dept');
+  if (ad) ad.onclick = addDepartment;
   bindModal();
 }
 function bindModal() {
@@ -515,16 +676,21 @@ function bindModal() {
       if (!title) { alert('請輸入任務標題'); return; }
       const code = document.getElementById('f-code').value.trim() || title.slice(0, 4);
       const due = document.getElementById('f-due').value;
+      const aSel = document.getElementById('f-assignee');
+      const assignee = aSel ? aSel.value : state.session.user.id;
+      const person = state.people.find(p => p.id === assignee);
       addTask({
         title, code,
         urgency: document.getElementById('f-urgency').value,
         due_at: due ? new Date(due).toISOString() : null,
+        assignee_id: assignee,
+        department_id: person?.department_id ?? state.profile?.department_id ?? null,
       });
     };
   }
 }
 
-/* ---------- Realtime:別人完成任務,你的畫面同步更新 ---------- */
+/* ---------- Realtime ---------- */
 function subscribeRealtime() {
   db.channel('tasks-live')
     .on('postgres_changes', { event: '*', schema: 'public', table: 'tasks' }, () => loadTasks())
@@ -535,16 +701,25 @@ function subscribeRealtime() {
 async function init() {
   const { data: { session } } = await db.auth.getSession();
   state.session = session;
-  if (session) { await loadProfile(); await loadTasks(); subscribeRealtime(); }
+  if (session) {
+    await loadProfile();
+    await Promise.all([loadTasks(), loadPeople()]);
+    subscribeRealtime();
+  }
   state.loading = false;
   render();
 }
 db.auth.onAuthStateChange(async (_event, session) => {
   const wasIn = !!state.session;
   state.session = session;
-  if (session && !wasIn) { state.loading = true; render();
-    await loadProfile(); await loadTasks(); subscribeRealtime(); state.loading = false; }
-  if (!session) { state.tasks = []; state.profile = null; }
+  if (session && !wasIn) {
+    state.loading = true; render();
+    await loadProfile();
+    await Promise.all([loadTasks(), loadPeople()]);
+    subscribeRealtime();
+    state.loading = false;
+  }
+  if (!session) { state.tasks = []; state.people = []; state.profile = null; state.page = 'board'; }
   render();
 });
 init();
